@@ -235,9 +235,9 @@ def ReadFunctions(functionTable, StringTable, length):
     for i in range(entryCount):
         nameOffset = 0
         if length == PointerLength.Int:
-            nameOffset == unpack("<I", data.read(4))[0]
+            nameOffset = unpack("<I", data.read(4))[0]
         elif length == PointerLength.Long:
-            nameOffset == unpack("<L", data.read(8))[0]
+            nameOffset = unpack("<L", data.read(8))[0]
         else:
             raise ValueError(f"Unknown pointer length {length}.")
         
@@ -452,7 +452,7 @@ def read_str(data):
         if char == b"\x00":
             break
         text += char
-    return text
+    return text.decode("shift-jis")
 
 with open("./sav.xq", "rb") as file:
     open_xseq(BytesIO(file.read()))
