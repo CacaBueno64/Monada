@@ -2,6 +2,7 @@ from compression import *
 from struct import pack, unpack, unpack_from, Struct
 from io import BytesIO
 from enum import Enum
+import re
 
 class CompressionType(Enum):
     null = 0
@@ -267,13 +268,13 @@ def CreateFunctions(functions, stringTable):
         
         return ScriptFunction((
             name,
-            function.jumpOffset,
-            function.jumpCount,
             function.instructionOffset,
             function.instructionEndOffset - function.instructionOffset,
+            function.jumpOffset,
+            function.jumpCount,
             function.parameterCount,
             function.localCount,
-            function.parameterCount,
+            function.objectCount,
         ))
     
     result = []
@@ -347,8 +348,8 @@ def CreateInstructions(instructions):
         return ScriptInstruction((
             instruction.argOffset,
             instruction.argCount,
-            instruction.instructionType,
             instruction.returnParameter,
+            instruction.instructionType,
         ))
     
     result = []
@@ -454,5 +455,242 @@ def read_str(data):
         text += char
     return text.decode("shift-jis")
 
-with open("./sav.xq", "rb") as file:
-    open_xseq(BytesIO(file.read()))
+
+def CreateValueExpression(value, argumentType, rawArgumentType = -1):
+    output = ""
+    if argumentType == ScriptArgumentType.Variable:
+        if value >= 0 and value <= 999:
+            output += f"unk{value}"
+        elif value >= 1000 and value <= 1999:
+            output += f"local{value - 1000}"
+        elif value >= 2000 and value <= 2999:
+            output += f"object{value - 2000}"
+        elif value >= 3000 and value <= 3999:
+            output += f"param{value - 3000}"
+        elif value >= 4000 and value <= 4999:
+            output += f"global{value - 4000}"
+    else:
+        if argumentType == ScriptArgumentType.Int:
+            output += f"{value}"
+        elif argumentType == ScriptArgumentType.StringHash:
+            output += f"{value}"
+        elif argumentType == ScriptArgumentType.Float:
+            output += f"{value}"
+        elif argumentType == ScriptArgumentType.String:
+            output += f'"{value}"'
+    
+    if rawArgumentType >= 0:
+        output += f"<{rawArgumentType}>"
+    
+    return output
+
+def CreateArrayIndexExpression(arrayVariable, indexes):
+    if type(arrayVariable) == ScriptArgument:
+        arrayVariable = CreateValueExpression(arrayVariable.Value, arrayVariable.Type, arrayVariable.RawArgumentType)
+    
+    output = arrayVariable
+    for index in indexes:
+        output += f"[{CreateValueExpression(index.Value, index.Type, index.RawArgumentType)}]"
+    
+    return output
+
+def CreateGotoStatement(instruction, script):
+    argument = script.Arguments[instruction.ArgumentIndex]
+    output = f"goto {CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)}"
+    return output
+
+def to_txt(filepath, script):
+    out = open(filepath, "wt")
+    
+    t = 0 # indentation level
+    
+    for function in script.Functions:
+        #function = script.Functions[7]
+        # function declaration
+        out.write(f"def {function.Name}(")
+        # function params
+        for i in range(function.ParameterCount):
+            out.write(f"param{i}")
+            out.write(", ") if i != function.ParameterCount -1 else 0
+        out.write("):\n")
+
+        # body function
+        t = 1
+
+        jumpLookup = {}
+        jumps = script.Jumps[function.JumpIndex:function.JumpIndex + function.JumpCount]
+        for jump in jumps:
+            jumpLookup[jump.InstructionIndex] = []
+        for jump in jumps:
+            jumpLookup[jump.InstructionIndex].append(jump)
+        if function.InstructionCount != 0:
+            for i in range(function.InstructionIndex, function.InstructionIndex + function.InstructionCount):
+                instruction = script.Instructions[i]
+
+                if jumpLookup.get(i):
+                    for jump in jumpLookup[i]:
+                        out.write(f'"{jump.Name}":\n')
+
+                if instruction.Type == 10:
+                    out.write("\t" * t + "yield\n")
+                elif instruction.Type == 11:
+                    out.write("\t" * t + "return ")
+                    if instruction.ArgumentCount > 0:
+                        argument = script.Arguments[instruction.ArgumentIndex]
+                        out.write(f"{CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)}\n")
+                    else:
+                        out.write("\n")
+                elif instruction.Type == 12:
+                    out.write("\t" * t + "exit()\n")
+                elif instruction.Type in (30, 33):
+                    out.write("\t" * t + "if ")
+                    if instruction.Type == 33:
+                        out.write("not ")
+                    argument = script.Arguments[instruction.ArgumentIndex + 1]
+                    out.write(f"{CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)}")
+                    out.write(f" {CreateGotoStatement(instruction, script)}\n")
+                elif instruction.Type == 31:
+                    out.write("\t" * t + f"{CreateGotoStatement(instruction, script)}\n")
+                elif instruction.Type in (240, 241):
+                    returnValue = CreateValueExpression(instruction.ReturnParameter, ScriptArgumentType.Variable)
+                    value = returnValue
+                    if instruction.ArgumentCount > 0:
+                        value = CreateArrayIndexExpression(
+                            returnValue, script.Arguments[instruction.ArgumentIndex:instruction.ArgumentIndex + instruction.ArgumentCount])
+                    out.write("\t" * t + f"{value}")
+                    if instruction.Type == 240:
+                        out.write("++\n")
+                    elif instruction.Type == 241:
+                        out.write("--\n")
+                else:
+                    leftValue = CreateValueExpression(instruction.ReturnParameter, ScriptArgumentType.Variable)
+                    left = leftValue
+                    if instruction.Type in (100, 250, 251, 252, 253, 254, 260, 261, 262, 270, 271):
+                        if instruction.ArgumentCount > 1:
+                            indexes3 = script.Arguments[
+                                instruction.ArgumentIndex + 1:(instruction.ArgumentIndex + 1) + instruction.ArgumentCount - 1]
+                            left = CreateArrayIndexExpression(leftValue, indexes3)
+                    right = ""
+                    equalsOperator = "="
+                    argument = script.Arguments[instruction.ArgumentIndex]
+                    if instruction.Type == 100:
+                        right = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                    elif instruction.Type in (110, 112, 120):
+                        value = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                        if instruction.Type == 110:
+                            right = f"~{value}"
+                        elif instruction.Type == 112:
+                            right = f"-{value}"
+                        elif instruction.Type == 120:
+                            right = f"not {value}"
+                    elif instruction.Type in (121, 122):
+                        argument1 = script.Arguments[instruction.ArgumentIndex + 1]
+                        lleft = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                        rright = CreateValueExpression(argument1.Value, argument1.Type, argument1.RawArgumentType)
+                        if instruction.Type == 121:
+                            right = f"{lleft} and {rright}"
+                        elif instruction.Type == 122:
+                            right = f"{lleft} or {rright}"
+                    elif instruction.Type in (130, 131, 132, 133, 134, 135, 140, 141, 150, 151, 152, 153, 154, 160, 161, 162, 170, 171):
+                        lleft = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                        if instruction.Type == 140:
+                            right = f"{lleft} + {CreateValueExpression(1, ScriptArgumentType.Int)}"
+                        elif instruction.Type == 141:
+                            right = f"{lleft} - {CreateValueExpression(1, ScriptArgumentType.Int)}"
+                        argument1 = script.Arguments[instruction.ArgumentIndex + 1]
+                        rright = CreateValueExpression(argument1.Value, argument1.Type, argument1.RawArgumentType)
+                        if instruction.Type == 130:
+                            right = f"{lleft} == {rright}"
+                        elif instruction.Type == 131:
+                            right = f"{lleft} != {rright}"
+                        elif instruction.Type == 132:
+                            right = f"{lleft} >= {rright}"
+                        elif instruction.Type == 133:
+                            right = f"{lleft} <= {rright}"
+                        elif instruction.Type == 134:
+                            right = f"{lleft} > {rright}"
+                        elif instruction.Type == 135:
+                            right = f"{lleft} < {rright}"
+                        elif instruction.Type == 150:
+                            right = f"{lleft} + {rright}"
+                        elif instruction.Type == 151:
+                            right = f"{lleft} - {rright}"
+                        elif instruction.Type == 152:
+                            right = f"{lleft} * {rright}"
+                        elif instruction.Type == 153:
+                            right = f"{lleft} / {rright}"
+                        elif instruction.Type == 154:
+                            right = f"{lleft} % {rright}"
+                        elif instruction.Type == 160:
+                            right = f"{lleft} & {rright}"
+                        elif instruction.Type == 161:
+                            right = f"{lleft} | {rright}"
+                        elif instruction.Type == 162:
+                            right = f"{lleft} ^ {rright}"
+                        elif instruction.Type == 170:
+                            right = f"{lleft} << {rright}"
+                        elif instruction.Type == 171:
+                            right = f"{lleft} >> {rright}"
+                    elif instruction.Type == 250:
+                        equalsOperator = "+="
+                        right = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                    elif instruction.Type == 251:
+                        equalsOperator = "-="
+                        right = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                    elif instruction.Type == 252:
+                        equalsOperator = "*="
+                        right = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                    elif instruction.Type == 253:
+                        equalsOperator = "/="
+                        right = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                    elif instruction.Type == 254:
+                        equalsOperator = "%="
+                        right = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                    elif instruction.Type == 260:
+                        equalsOperator = "&="
+                        right = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                    elif instruction.Type == 261:
+                        equalsOperator = "|="
+                        right = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                    elif instruction.Type == 262:
+                        equalsOperator = "^="
+                        right = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                    elif instruction.Type == 270:
+                        equalsOperator = "<<="
+                        right = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                    elif instruction.Type == 271:
+                        equalsOperator = ">>="
+                        right = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                    elif instruction.Type in (511, 512, 513):
+                        print("OH MY GOD A CAST VALUE EXPRESSION")
+                        pass
+                        #castValue = CreateValueExpression(argument.Value, argument.Type, argument.RawArgumentType)
+                    elif instruction.Type == 523:
+                        print("OH MY GOD A SWITCH STATEMENT")
+                        pass
+                    elif instruction.Type == 530:
+                        print("OH MY GOD A 'new' KEYWORD")
+                        pass
+                    elif instruction.Type == 531:
+                        indexes = script.Arguments[
+                                instruction.ArgumentIndex + 1:(instruction.ArgumentIndex + 1) + instruction.ArgumentCount - 1]
+                        right = CreateArrayIndexExpression(argument, indexes)
+                    else: # Function calls (WIP)
+                        pass
+                        #identifier = ""
+                        #if not (instruction.Type != 20 or instruction.ArgumentCount <= 0):
+                        #    identifier = str(script.Arguments[instruction.ArgumentIndex].Value)
+                    out.write("\t" * t + f"{left} {equalsOperator} {right}\n")
+
+            instructionEndIndex = function.InstructionIndex + function.InstructionCount
+            if jumpLookup.get(instructionEndIndex):
+                for jump in jumpLookup[instructionEndIndex]:
+                    out.write(f'"{jump.Name}":\n')
+
+            out.write("\n")
+    
+    out.close()
+
+with open("./filepath.xq", "rb") as file:
+    script = open_xseq(BytesIO(file.read()))
+    to_txt("./filepath.txt", script)
